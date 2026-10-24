@@ -1,232 +1,133 @@
 
-import csv
 import mysql.connector
-from mysql.connector import Error
 
 
-def create_tables(connection):
-    cursor = connection.cursor()
+# Only allow approved columns in SQL queries.
+ALLOWED_COLUMNS = {
+    "student.id": "s.student_id",
+    "student.name": "s.name",
+    "student.spi": "s.SPI",
+    "course.id": "c.course_id",
+    "course.name": "c.course_name",
+    "registration.course_id": "cr.course_id"
+}
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS Student (
-            student_id INT PRIMARY KEY,
-            name VARCHAR(100) NOT NULL,
-            SPI DECIMAL(3,1) NOT NULL
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS CourseRegistration (
-            student_id INT,
-            course_id VARCHAR(20),
-            PRIMARY KEY (student_id, course_id),
-            FOREIGN KEY (student_id) REFERENCES Student(student_id)
-        )
-    """)
-
-    connection.commit()
-    cursor.close()
+ALLOWED_FILTERS = {
+    "=": "=",
+    ">": ">",
+    "<": "<",
+    ">=": ">=",
+    "<=": "<=",
+    "LIKE": "LIKE"
+}
 
 
-def import_students(connection, file_path):
-    cursor = connection.cursor()
+def build_query(columns, filters, order_column, direction, limit):
+    if not columns:
+        raise ValueError("Select at least one column.")
 
-    try:
-        with open(file_path, "r", newline="", encoding="utf-8-sig") as file:
-            reader = csv.DictReader(file)
+    for column in columns:
+        if column not in ALLOWED_COLUMNS:
+            raise ValueError("Invalid column: " + column)
 
-            if reader.fieldnames is None:
-                raise ValueError("Student CSV file is empty.")
+    if order_column not in ALLOWED_COLUMNS:
+        raise ValueError("Invalid order column.")
 
-            reader.fieldnames = [
-                field.strip() for field in reader.fieldnames
-            ]
+    direction = direction.upper()
+    if direction not in ("ASC", "DESC"):
+        raise ValueError("Sort direction must be ASC or DESC.")
 
-            required = {"student_id", "name", "SPI"}
-            missing = required - set(reader.fieldnames)
+    if not 1 <= limit <= 1000:
+        raise ValueError("Limit must be between 1 and 1000.")
 
-            if missing:
-                raise ValueError(
-                    f"Student CSV missing columns: {sorted(missing)}. "
-                    f"Found: {reader.fieldnames}"
-                )
+    selected = ", ".join(ALLOWED_COLUMNS[col] for col in columns)
 
-            for line_number, row in enumerate(reader, start=2):
-                row = {
-                    key.strip(): value.strip() if value else value
-                    for key, value in row.items()
-                    if key is not None
-                }
+    query = f"""
+        SELECT {selected}
+        FROM Student s
+        JOIN CourseRegistration cr
+            ON s.student_id = cr.student_id
+        JOIN Course c
+            ON cr.course_id = c.course_id
+    """
 
-                try:
-                    student_id = int(row["student_id"])
-                    name = row["name"]
-                    spi = float(row["SPI"])
-                except (ValueError, TypeError) as error:
-                    raise ValueError(
-                        f"Invalid student data at CSV line {line_number}: "
-                        f"{row}"
-                    ) from error
+    conditions = []
+    parameters = []
 
-                if not 0 <= spi <= 10:
-                    raise ValueError(
-                        f"SPI must be between 0 and 10 at line "
-                        f"{line_number}."
-                    )
+    for column, operator, value in filters:
+        if column not in ALLOWED_COLUMNS:
+            raise ValueError("Invalid filter column.")
 
-                cursor.execute("""
-                    INSERT INTO Student (student_id, name, SPI)
-                    VALUES (%s, %s, %s)
-                    ON DUPLICATE KEY UPDATE
-                        name = VALUES(name),
-                        SPI = VALUES(SPI)
-                """, (student_id, name, spi))
+        if operator.upper() not in ALLOWED_FILTERS:
+            raise ValueError("Invalid filter operator.")
 
-        connection.commit()
-        print("Student data imported successfully.")
+        sql_column = ALLOWED_COLUMNS[column]
+        sql_operator = ALLOWED_FILTERS[operator.upper()]
 
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        cursor.close()
+        conditions.append(f"{sql_column} {sql_operator} %s")
+        parameters.append(value)
 
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
 
-def import_registrations(connection, file_path):
-    cursor = connection.cursor()
+    query += (
+        f" ORDER BY {ALLOWED_COLUMNS[order_column]} {direction}"
+        f" LIMIT {limit}"
+    )
 
-    try:
-        with open(file_path, "r", newline="", encoding="utf-8-sig") as file:
-            reader = csv.DictReader(file)
-
-            if reader.fieldnames is None:
-                raise ValueError("Registration CSV file is empty.")
-
-            reader.fieldnames = [
-                field.strip() for field in reader.fieldnames
-            ]
-
-            required = {"student_id", "course_id"}
-            missing = required - set(reader.fieldnames)
-
-            if missing:
-                raise ValueError(
-                    f"Registration CSV missing columns: {sorted(missing)}. "
-                    f"Found: {reader.fieldnames}"
-                )
-
-            for line_number, row in enumerate(reader, start=2):
-                row = {
-                    key.strip(): value.strip() if value else value
-                    for key, value in row.items()
-                    if key is not None
-                }
-
-                try:
-                    student_id = int(row["student_id"])
-                    course_id = row["course_id"]
-
-                    cursor.execute("""
-                        INSERT IGNORE INTO CourseRegistration
-                        (student_id, course_id)
-                        VALUES (%s, %s)
-                    """, (student_id, course_id))
-
-                except (ValueError, TypeError) as error:
-                    raise ValueError(
-                        f"Invalid registration data at CSV line "
-                        f"{line_number}: {row}"
-                    ) from error
-
-        connection.commit()
-        print("Registration data imported successfully.")
-
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        cursor.close()
-
-
-def display_students(connection, course_id, threshold):
-    cursor = connection.cursor()
-
-    try:
-        query = """
-            SELECT s.student_id, s.name, s.SPI, cr.course_id
-            FROM Student s
-            JOIN CourseRegistration cr
-                ON s.student_id = cr.student_id
-            WHERE cr.course_id = %s AND s.SPI > %s
-            ORDER BY s.SPI DESC, s.student_id ASC
-        """
-
-        cursor.execute(query, (course_id, threshold))
-        students = cursor.fetchall()
-
-        if not students:
-            print("No students found matching the criteria.")
-            return
-
-        print("\nStudents matching the criteria:")
-        print("-" * 45)
-
-        for student_id, name, spi, course in students:
-            print(student_id, name, spi, course)
-
-    finally:
-        cursor.close()
+    return query, parameters
 
 
 def main():
     connection = None
+    cursor = None
 
     try:
-        host = input("MySQL host (default localhost): ").strip() or "localhost"
-        user = input("MySQL username: ").strip()
-        password = input("MySQL password: ")
-        database = input("Existing database name: ").strip()
+        # Example query configuration.
+        columns = ["student.name", "course.name"]
 
-        connection = mysql.connector.connect(
-            host=host,
-            user=user,
-            password=password,
-            database=database
+        filters = [
+            ("course.id", "=", "PY101")
+        ]
+
+        order_column = "student.spi"
+        direction = "DESC"
+        limit = 2
+
+        query, parameters = build_query(
+            columns, filters, order_column, direction, limit
         )
 
-        if connection.is_connected():
-            print("Connected to MySQL successfully.")
+        print("SQL_OK")
+        print("Query:", " ".join(query.split()))
+        print("Parameters:", parameters)
 
-            create_tables(connection)
+        # Configure your existing MySQL database.
+        connection = mysql.connector.connect(
+            host="localhost",
+            user=input("MySQL username: ").strip(),
+            password=input("MySQL password: "),
+            database=input("Database name: ").strip()
+        )
 
-            student_file = input("Student CSV file path: ").strip()
-            registration_file = input(
-                "Registration CSV file path: "
-            ).strip()
+        cursor = connection.cursor()
+        cursor.execute(query, parameters)
 
-            import_students(connection, student_file)
-            import_registrations(connection, registration_file)
+        for row in cursor.fetchall():
+            print(*row)
 
-            course_id = input("Enter course ID: ").strip()
-            threshold = float(input("Enter SPI threshold: "))
-
-            if not 0 <= threshold <= 10:
-                print("Error: SPI threshold must be between 0 and 10.")
-                return
-
-            display_students(connection, course_id, threshold)
-
-    except Error as error:
-        print("MySQL error:", error)
-
-    except (OSError, ValueError, KeyError, csv.Error) as error:
-        print("Input or file error:", error)
+    except (ValueError, mysql.connector.Error) as error:
+        print("Error:", error)
 
     finally:
+        if cursor is not None:
+            cursor.close()
+
         if connection is not None and connection.is_connected():
             connection.close()
-            print("MySQL connection closed.")
 
 
 if __name__ == "__main__":
     main()
+
+    
